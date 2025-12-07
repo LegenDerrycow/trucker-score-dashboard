@@ -11,21 +11,31 @@ import streamlit as st
 # Data / Scoring Helpers
 # ==========================
 
-def flatten_qcmobile_basics(raw_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+def flatten_qcmobile_basics(raw_data: Any) -> List[Dict[str, Any]]:
     """
-    Flatten QCMobile /carriers/:dotNumber/basics JSON into a list of simple dicts, one per BASIC.
+    Flatten QCMobile /carriers/:dotNumber/basics JSON into a list of simple dicts,
+    one per BASIC.
+
+    Handles both:
+      1) {"content": [ { "basic": {...} }, ... ], "retrievalDate": "..."}
+      2) [ { "basic": {...} }, ... ]
     """
     basics_flat: List[Dict[str, Any]] = []
 
-    if not isinstance(raw_data, dict):
+    # Case 1: response is a list of entries
+    if isinstance(raw_data, list):
+        content = raw_data
+    # Case 2: response is an object with "content"
+    elif isinstance(raw_data, dict):
+        content = raw_data.get("content", [])
+    else:
         return basics_flat
 
-    content = raw_data.get("content", [])
     if not isinstance(content, list):
         return basics_flat
 
     for entry in content:
-        basic = entry.get("basic", {}) or {}
+        basic = (entry or {}).get("basic", {}) or {}
         basics_type = basic.get("basicsType", {}) or {}
 
         short_desc = basics_type.get("basicsShortDesc")
@@ -48,7 +58,6 @@ def flatten_qcmobile_basics(raw_data: Dict[str, Any]) -> List[Dict[str, Any]]:
         percentile_num: Optional[float] = None
         if isinstance(percentile_raw, str):
             txt = percentile_raw.strip().lower()
-            # skip non-numeric statuses like "not public", "insufficient data", etc.
             if txt.endswith("%"):
                 try:
                     percentile_num = float(txt.replace("%", ""))
@@ -94,11 +103,14 @@ def flatten_qcmobile_basics(raw_data: Dict[str, Any]) -> List[Dict[str, Any]]:
 def evaluate_basic_risk(row: Dict[str, Any]) -> Tuple[str, int]:
     """
     Assign a risk band and numeric risk score to a BASIC based on:
-    - Percentile vs FMCSA violation threshold
+    - Percentile vs FMCSA violation threshold (preferred)
+    - Fallback: measureValue relative to basicsViolationThreshold
     - Intervention flags (exceeded threshold, on-road, serious violation)
     """
     pct = row.get("Percentile (num)")
     thresh = row.get("Violation Threshold (num)")
+    measure_num = row.get("Measure (num)")
+
     exceeded = row.get("Exceeded FMCSA Threshold") == "Y"
     onroad_def = row.get("On-Road Threshold Violation") == "Y"
     serious = row.get("Serious Violation (12m)") == "Y"
@@ -106,6 +118,7 @@ def evaluate_basic_risk(row: Dict[str, Any]) -> Tuple[str, int]:
     band = "Unknown"
     score = 0
 
+    # Primary: percentile vs threshold
     if pct is not None and thresh is not None:
         if pct >= thresh:
             band = "High"
@@ -114,6 +127,22 @@ def evaluate_basic_risk(row: Dict[str, Any]) -> Tuple[str, int]:
             band = "Medium"
             score += 2
         elif pct >= 20:
+            band = "Low"
+            score += 1
+        else:
+            band = "Very Low"
+            score += 0
+
+    # Fallback: use measure / threshold ratio if no percentile
+    elif measure_num is not None and thresh is not None and thresh > 0:
+        ratio = measure_num / thresh  # e.g. 11 / 65 ≈ 0.17
+        if ratio >= 1.0:
+            band = "High"
+            score += 3
+        elif ratio >= 0.75:
+            band = "Medium"
+            score += 2
+        elif ratio >= 0.3:
             band = "Low"
             score += 1
         else:
@@ -137,23 +166,44 @@ def compute_carrier_measure(basics_flat: List[Dict[str, Any]]) -> Optional[float
     """
     Compute our "golf score" for the carrier.
 
-    Primary logic:
-        - Use numeric BASIC percentiles, not raw FMCSA measure values.
-        - carrier_measure = max(percentile) / 25  → 0–4 range (lower is better).
+    Preferred:
+        - Use numeric BASIC percentiles:
+            measure = max(percentile) / 25  → 0–4 (lower is better).
 
-    If *no* BASIC has a numeric percentile (all "Not Public" / "insufficient data"):
-        - Return None to indicate "Score not available".
+    Fallback:
+        - If no numeric percentiles exist, use measure/threshold:
+            ratio = measureValue / basicsViolationThreshold
+            pseudo_percentile = ratio * 100 (clipped 0–100)
+            measure = max(pseudo_percentile) / 25 → 0–4.
+
+    If neither percentiles nor measure/threshold data exist:
+        - Return None (score not available).
     """
+    # Preferred: real percentiles
     percents = [
         b.get("Percentile (num)")
         for b in basics_flat
         if b.get("Percentile (num)") is not None
     ]
 
-    if not percents:
-        return None  # no public/usable percentiles → cannot compute a score
+    if percents:
+        measure = max(percents) / 25.0
+        return round(measure, 3)
 
-    measure = max(percents) / 25.0  # 0–100 → 0–4
+    # Fallback: use measure / threshold ratio
+    pseudo_percents: List[float] = []
+    for b in basics_flat:
+        m = b.get("Measure (num)")
+        thresh = b.get("Violation Threshold (num)")
+        if m is not None and thresh is not None and thresh > 0:
+            ratio = m / thresh        # e.g. 11 / 65 ≈ 0.17
+            pct_est = max(0.0, min(100.0, ratio * 100.0))
+            pseudo_percents.append(pct_est)
+
+    if not pseudo_percents:
+        return None
+
+    measure = max(pseudo_percents) / 25.0
     return round(measure, 3)
 
 
@@ -293,7 +343,7 @@ def render_gauge(measure: Optional[float]):
         st.info("Score not available – BASIC percentiles are not public or insufficient.")
         return
 
-    max_scale = 4.0  # our score range is 0–4 (from percentiles)
+    max_scale = 4.0  # our score range is 0–4 (from percentiles/ratios)
     value = min(max(measure, 0.0), max_scale)
 
     fig = go.Figure(
