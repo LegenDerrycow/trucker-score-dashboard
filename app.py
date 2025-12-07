@@ -1,5 +1,5 @@
 import os
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -13,8 +13,7 @@ import streamlit as st
 
 def flatten_qcmobile_basics(raw_data: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
-    Flatten QCMobile /carriers/:dotNumber/basics JSON (as in your sample)
-    into a list of simple dicts, one per BASIC.
+    Flatten QCMobile /carriers/:dotNumber/basics JSON into a list of simple dicts, one per BASIC.
     """
     basics_flat: List[Dict[str, Any]] = []
 
@@ -46,21 +45,24 @@ def flatten_qcmobile_basics(raw_data: Dict[str, Any]) -> List[Dict[str, Any]]:
         run_date = basic.get("basicsRunDate")
 
         # Normalize numeric fields
-        percentile_num = None
-        if isinstance(percentile_raw, str) and percentile_raw.strip().endswith("%"):
-            try:
-                percentile_num = float(percentile_raw.strip().replace("%", ""))
-            except ValueError:
-                percentile_num = None
+        percentile_num: Optional[float] = None
+        if isinstance(percentile_raw, str):
+            txt = percentile_raw.strip().lower()
+            # skip non-numeric statuses like "not public", "insufficient data", etc.
+            if txt.endswith("%"):
+                try:
+                    percentile_num = float(txt.replace("%", ""))
+                except ValueError:
+                    percentile_num = None
 
-        measure_num = None
+        measure_num: Optional[float] = None
         if measure_raw is not None:
             try:
                 measure_num = float(str(measure_raw))
             except ValueError:
                 measure_num = None
 
-        threshold_num = None
+        threshold_num: Optional[float] = None
         if threshold_raw is not None:
             try:
                 threshold_num = float(str(threshold_raw))
@@ -74,7 +76,7 @@ def flatten_qcmobile_basics(raw_data: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "Percentile": percentile_raw,
                 "Percentile (num)": percentile_num,
                 "Measure": measure_raw,
-                "Measure (num)": measure_num,
+                "Measure (num)": measure_num,           # raw FMCSA measure, not our score
                 "Violation Threshold": threshold_raw,
                 "Violation Threshold (num)": threshold_num,
                 "Exceeded FMCSA Threshold": exceeded,
@@ -131,36 +133,37 @@ def evaluate_basic_risk(row: Dict[str, Any]) -> Tuple[str, int]:
     return band, score
 
 
-def compute_carrier_measure(basics_flat: List[Dict[str, Any]]) -> float:
+def compute_carrier_measure(basics_flat: List[Dict[str, Any]]) -> Optional[float]:
     """
-    MVP carrier "golf score":
+    Compute our "golf score" for the carrier.
 
-        carrier_measure = max(Measure (num) for each BASIC)
+    Primary logic:
+        - Use numeric BASIC percentiles, not raw FMCSA measure values.
+        - carrier_measure = max(percentile) / 25  → 0–4 range (lower is better).
 
-    This uses the worst BASIC Measure as the overall score.
-    Lower is better.
+    If *no* BASIC has a numeric percentile (all "Not Public" / "insufficient data"):
+        - Return None to indicate "Score not available".
     """
-    measures = [
-        row.get("Measure (num)")
-        for row in basics_flat
-        if row.get("Measure (num)") is not None
+    percents = [
+        b.get("Percentile (num)")
+        for b in basics_flat
+        if b.get("Percentile (num)") is not None
     ]
 
-    if not measures:
-        return 0.0
+    if not percents:
+        return None  # no public/usable percentiles → cannot compute a score
 
-    return round(max(measures), 3)
+    measure = max(percents) / 25.0  # 0–100 → 0–4
+    return round(measure, 3)
 
 
-def status_from_measure(measure: float) -> Tuple[str, str]:
+def status_from_measure(measure: Optional[float]) -> Tuple[str, str]:
     """
     Map the carrier measure to a traffic light status.
-
-    Thresholds from your spec:
-        Green:  Measure < 1.5
-        Yellow: 1.5 – 4.0
-        Red:    > 4.0
     """
+    if measure is None:
+        return "Unknown", "⚪️"
+
     if measure < 1.5:
         return "Green", "🟢"
     if measure <= 4.0:
@@ -170,7 +173,7 @@ def status_from_measure(measure: float) -> Tuple[str, str]:
 
 def summarize_insurance_impact(
     basics_flat: List[Dict[str, Any]],
-    measure: float,
+    measure: Optional[float],
     overall_status: str,
 ) -> Tuple[str, str]:
     """
@@ -180,12 +183,21 @@ def summarize_insurance_impact(
     has_medium = any(b.get("Risk Level") == "Medium" for b in basics_flat)
     has_exceeded = any(b.get("Exceeded FMCSA Threshold") == "Y" for b in basics_flat)
 
+    if measure is None or overall_status == "Unknown":
+        band = "Limited visibility"
+        text = (
+            "BASIC percentiles for this carrier are not public or show insufficient data. "
+            "Underwriters will lean more on loss history, operations, and telematics. "
+            "Treat this as a neutral to slightly negative signal until more data is available."
+        )
+        return band, text
+
     if has_high or has_exceeded or overall_status == "Red":
         band = "High rate pressure"
         text = (
             "At least one BASIC is above or near FMCSA intervention thresholds. "
-            "Underwriters will treat this as a higher-risk account and you should "
-            "plan for roughly +15–30% rate pressure unless you show a clear fix."
+            "Underwriters will view this as higher risk; plan for roughly +15–30% "
+            "rate pressure unless you show a clear fix."
         )
     elif has_medium or overall_status == "Yellow":
         band = "Moderate rate pressure"
@@ -272,15 +284,16 @@ def trend_label_for_basic(row: Dict[str, Any]) -> str:
 # UI Helpers
 # ==========================
 
-def render_gauge(measure: float):
+def render_gauge(measure: Optional[float]):
     """
     Render a credit-score-style gauge using Plotly.
-    Measure: assume 0–6+ range with:
-        0–1.5   Green
-        1.5–4.0 Yellow
-        4.0–6+  Red
+    If measure is None, show an info message instead.
     """
-    max_scale = 6.0
+    if measure is None:
+        st.info("Score not available – BASIC percentiles are not public or insufficient.")
+        return
+
+    max_scale = 4.0  # our score range is 0–4 (from percentiles)
     value = min(max(measure, 0.0), max_scale)
 
     fig = go.Figure(
@@ -288,16 +301,19 @@ def render_gauge(measure: float):
             mode="gauge+number",
             value=value,
             number={"suffix": "", "font": {"size": 30}},
-            # Empty title to avoid clipping at top
-            title={"text": "", "font": {"size": 1}},
+            title={"text": "", "font": {"size": 1}},  # avoid clipping
             gauge={
                 "axis": {"range": [0, max_scale]},
                 "bar": {"thickness": 0.3},
                 "steps": [
                     {"range": [0, 1.5], "color": "#22c55e"},   # green
                     {"range": [1.5, 4.0], "color": "#eab308"}, # yellow
-                    {"range": [4.0, max_scale], "color": "#ef4444"},  # red
                 ],
+                "threshold": {
+                    "line": {"color": "#ef4444", "width": 0},
+                    "thickness": 0.0,
+                    "value": value,
+                },
             },
         )
     )
@@ -374,7 +390,7 @@ if st.button("Check Carrier", type="primary"):
                         b["Risk Score"] = score
                         b["Trend Label"] = trend_label_for_basic(b)
 
-                    # Overall measure + status
+                    # Overall measure + status (may be None)
                     measure = compute_carrier_measure(basics_flat)
                     status, emoji = status_from_measure(measure)
 
@@ -397,24 +413,30 @@ if st.button("Check Carrier", type="primary"):
                     with top_left:
                         st.subheader("Safety Score")
                         render_gauge(measure)
-                        st.caption("Lower is better. Based on your worst BASIC Measure.")
+                        if measure is not None:
+                            st.caption(
+                                "Lower is better. Based on your highest (worst) BASIC percentile."
+                            )
 
                     with top_mid:
                         st.subheader("Status")
-                        if status == "Green":
-                            st.success(f"{emoji} {status} – {measure}")
-                        elif status == "Yellow":
-                            st.warning(f"{emoji} {status} – {measure}")
+                        if measure is None:
+                            st.info("⚪️ Unknown – score not available.")
                         else:
-                            st.error(f"{emoji} {status} – {measure}")
-                        st.caption("Think of Green ≈ good credit, Red ≈ substandard.")
+                            if status == "Green":
+                                st.success(f"{emoji} {status} – {measure}")
+                            elif status == "Yellow":
+                                st.warning(f"{emoji} {status} – {measure}")
+                            else:
+                                st.error(f"{emoji} {status} – {measure}")
+                            st.caption("Think of Green ≈ good credit, Red ≈ substandard.")
 
                     with top_right:
                         st.subheader("Insurance Impact")
                         st.write(f"**{impact_band}**")
                         st.write(impact_text)
 
-                    # ===== Top factors (cleaned up) =====
+                    # ===== Top factors =====
                     st.markdown("---")
                     st.subheader("Top Factors Affecting Your Insurance")
 
@@ -441,7 +463,6 @@ if st.button("Check Carrier", type="primary"):
                                     value=f"{risk_emoji(risk_level)} {risk_level}",
                                 )
 
-                                # Short bullet stats
                                 if pct is not None and thresh is not None:
                                     st.write(f"- {pct} vs threshold {thresh}")
                                 if insp is not None:
@@ -449,7 +470,7 @@ if st.button("Check Carrier", type="primary"):
                                 if viol is not None:
                                     st.write(f"- {viol} total violations (24m)")
 
-                    # ===== Focus areas & action plan (shorter) =====
+                    # ===== Focus areas & action plan =====
                     st.markdown("---")
                     st.subheader("Focus Areas & Action Plan")
 
@@ -464,7 +485,7 @@ if st.button("Check Carrier", type="primary"):
                             st.markdown(f"### {name} – {risk_emoji(risk_level)} {risk_level}")
                             st.caption(trend)
 
-                            items = action_items_for_basic(name)[:3]  # keep it tight
+                            items = action_items_for_basic(name)[:3]
                             for item in items:
                                 st.write(f"- {item}")
 
