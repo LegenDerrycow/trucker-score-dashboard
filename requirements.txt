@@ -1,4 +1,5 @@
 streamlit
-requests
 pandas
+requests
 altair
+plotly
