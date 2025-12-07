@@ -1,45 +1,22 @@
 import os
-import requests
+from typing import List, Dict, Any, Tuple
+
 import pandas as pd
+import plotly.graph_objects as go
+import requests
 import streamlit as st
 
 
-# ---------- Flatten QCMobile BASICs ----------
+# ==========================
+# Data / Scoring Helpers
+# ==========================
 
-def flatten_qcmobile_basics(raw_data):
+def flatten_qcmobile_basics(raw_data: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
-    Take the JSON returned by QCMobile /carriers/:dotNumber/basics
-    and flatten it into a list of simple dicts, one per BASIC.
-
-    Expected structure (as in your sample):
-
-    {
-      "content": [
-        {
-          "basic": {
-            "basicsPercentile": "18%",
-            "basicsRunDate": "...",
-            "basicsType": {
-              "basicsCode": "Unsafe Driving",
-              "basicsId": 11,
-              "basicsShortDesc": "Unsafe Driving"
-            },
-            "basicsViolationThreshold": "50",
-            "exceededFMCSAInterventionThreshold": "Y/N",
-            "measureValue": "1.02",
-            "onRoadPerformanceThresholdViolationIndicator": "Y/N",
-            "seriousViolationFromInvestigationPast12MonthIndicator": "Y/N",
-            "totalInspectionWithViolation": 155,
-            "totalViolation": 170
-          },
-          "_links": {...}
-        },
-        ...
-      ],
-      "retrievalDate": "..."
-    }
+    Flatten QCMobile /carriers/:dotNumber/basics JSON (as in your sample)
+    into a list of simple dicts, one per BASIC.
     """
-    basics_flat = []
+    basics_flat: List[Dict[str, Any]] = []
 
     if not isinstance(raw_data, dict):
         return basics_flat
@@ -112,12 +89,9 @@ def flatten_qcmobile_basics(raw_data):
     return basics_flat
 
 
-# ---------- Risk evaluation & scoring ----------
-
-def evaluate_basic_risk(row):
+def evaluate_basic_risk(row: Dict[str, Any]) -> Tuple[str, int]:
     """
     Assign a risk band and numeric risk score to a BASIC based on:
-
     - Percentile vs FMCSA violation threshold
     - Intervention flags (exceeded threshold, on-road, serious violation)
     """
@@ -157,7 +131,7 @@ def evaluate_basic_risk(row):
     return band, score
 
 
-def compute_carrier_measure(basics_flat):
+def compute_carrier_measure(basics_flat: List[Dict[str, Any]]) -> float:
     """
     MVP carrier "golf score":
 
@@ -178,7 +152,7 @@ def compute_carrier_measure(basics_flat):
     return round(max(measures), 3)
 
 
-def status_from_measure(measure: float):
+def status_from_measure(measure: float) -> Tuple[str, str]:
     """
     Map the carrier measure to a traffic light status.
 
@@ -194,12 +168,15 @@ def status_from_measure(measure: float):
     return "Red", "🔴"
 
 
-def summarize_insurance_impact(basics_flat, measure, overall_status):
+def summarize_insurance_impact(
+    basics_flat: List[Dict[str, Any]],
+    measure: float,
+    overall_status: str,
+) -> Tuple[str, str]:
     """
-    Return a short narrative about likely insurance impact based on:
-
+    Return a narrative about likely insurance impact based on:
     - Presence of High/Medium risk BASICs
-    - Intervention flags (exceeded threshold)
+    - Intervention flags
     - Overall carrier measure
     """
     has_high = any(b.get("Risk Level") == "High" for b in basics_flat)
@@ -213,8 +190,7 @@ def summarize_insurance_impact(basics_flat, measure, overall_status):
         text = (
             "You are above FMCSA intervention thresholds in at least one BASIC or very "
             "close to them. Many insurers will view this as a high-risk account. "
-            "Expect meaningful rate pressure (rough order +15–30%+) at renewal and "
-            "reduced market appetite."
+            "Expect meaningful rate pressure (roughly +15–30%+) and fewer carrier options."
         )
     elif has_medium or overall_status == "Yellow":
         band = "Moderate rate pressure"
@@ -229,14 +205,14 @@ def summarize_insurance_impact(basics_flat, measure, overall_status):
         text = (
             "Your BASICs are well below FMCSA thresholds with no major flags. "
             "Under normal market conditions this looks like a well-managed account. "
-            "Expect flat to modest movements (roughly 0–5%) driven more by market "
-            "conditions than your own safety performance."
+            "Expect mostly flat to modest movements (roughly 0–5%), driven more by "
+            "market conditions than your own safety performance."
         )
 
     return band, text
 
 
-def action_items_for_basic(name: str):
+def action_items_for_basic(name: str) -> List[str]:
     """
     Return a list of recommended actions for a given BASIC name.
     Uses simple keyword matching.
@@ -245,61 +221,159 @@ def action_items_for_basic(name: str):
 
     if "unsafe" in name_lower:
         return [
-            "Run a violation drilldown: identify top drivers and locations contributing to Unsafe Driving.",
+            "Identify top drivers and locations driving Unsafe Driving violations.",
             "Implement targeted coaching and ride-alongs for high-risk drivers.",
             "Tighten policies on speeding, following distance, and mobile phone use.",
-            "Consider telematics or camera-based coaching for hard braking and speeding.",
+            "Consider telematics or cameras for speeding / harsh braking alerts.",
         ]
     if "hos" in name_lower or "hours-of-service" in name_lower:
         return [
-            "Audit ELD logs weekly for form-and-manner and HOS violations.",
+            "Audit ELD logs weekly for HOS and form-and-manner violations.",
             "Lock down log edits and require documented reasons for any changes.",
-            "Provide refresher training on 11/14-hour rules and split sleeper provisions.",
-            "Use alerts for approaching HOS limits to reduce roadside violations.",
+            "Refresh driver training on 11/14-hour rules and split sleeper provisions.",
+            "Set alerts for approaching HOS limits to avoid roadside violations.",
         ]
     if "driver fitness" in name_lower:
         return [
-            "Audit all CDLs, endorsements, and medical cards for currency and accuracy.",
-            "Implement a pre-trip document check process for newly dispatched drivers.",
+            "Audit all CDLs, endorsements, and medical cards for currency.",
+            "Set reminders for upcoming expirations and rechecks.",
             "Tighten hiring and qualification file reviews before onboarding.",
-            "Work with your agent to show documented Q-file cleanup before renewal.",
+            "Document all Q-file cleanup and share with your broker before renewal.",
         ]
     if "drug" in name_lower or "alcohol" in name_lower or "substances" in name_lower:
         return [
-            "Review your random testing program for proper selection rates and follow-up.",
-            "Document all policy violations and corrective actions taken.",
+            "Review your random testing program for proper rates and follow-up.",
+            "Document all positives and refusals with corrective actions.",
             "Refresh driver training on your drug and alcohol policy.",
-            "Ensure all positives and refusals are handled and documented per regulation.",
+            "Ensure clearinghouse reporting and return-to-duty processes are followed.",
         ]
     if "vehicle maint" in name_lower or "maintenance" in name_lower:
         return [
-            "Map violations back to specific units and shops to find patterns.",
+            "Map violations back to specific units, routes, and shops.",
             "Tighten your preventive maintenance schedule and track completion.",
-            "Enforce pre- and post-trip DVIRs and close the loop on defects.",
-            "Focus first on brakes, tires, and lights—high-impact, visible at roadside.",
+            "Enforce DVIRs and close the loop on defect repairs.",
+            "Prioritize brakes, tires, and lights—high-impact and visible at roadside.",
         ]
 
     # Generic fallback
     return [
         "Review recent violations in this BASIC and identify repeat patterns.",
-        "Prioritize corrective actions that remove violations from future inspections.",
-        "Document your plan and share it with your broker before renewal.",
+        "Prioritize fixes that reduce future roadside violations.",
+        "Document your corrective action plan and share it before renewal.",
     ]
 
 
-# ---------- Streamlit UI ----------
+def trend_label_for_basic(row: Dict[str, Any]) -> str:
+    """
+    Simple pseudo-trend label based on risk level and proximity to threshold.
+    (True historical trending would require stored snapshots.)
+    """
+    band = row.get("Risk Level")
+    pct = row.get("Percentile (num)")
+    thresh = row.get("Violation Threshold (num)")
 
-st.set_page_config(page_title="Credit Karma for Truckers", page_icon="🚛")
+    if band == "High":
+        return "🔥 Critical – above threshold"
+    if band == "Medium":
+        return "⚠️ Watch – near threshold"
+    if band == "Low":
+        # If close to 20% or 10 points below threshold, it’s a light watch
+        if pct is not None and thresh is not None and pct > (thresh - 15):
+            return "● Stable but rising"
+        return "● Stable"
+    if band == "Very Low":
+        return "✅ Healthy"
+    return "● No clear signal"
+
+
+def simulate_basic_improvement(
+    basics_flat: List[Dict[str, Any]],
+    target_basic_name: str,
+    reduction_pct: float,
+) -> float:
+    """
+    Simple simulator: reduce the Measure of one BASIC by X% and recompute
+    the carrier measure (max of BASIC measures).
+    """
+    reduced_measures = []
+
+    for b in basics_flat:
+        m = b.get("Measure (num)")
+        if m is None:
+            continue
+        name = b.get("BASIC") or b.get("BASIC Code")
+        if name == target_basic_name:
+            m = m * (1.0 - reduction_pct / 100.0)
+        reduced_measures.append(m)
+
+    if not reduced_measures:
+        return 0.0
+
+    return round(max(reduced_measures), 3)
+
+
+# ==========================
+# UI Helpers
+# ==========================
+
+def render_gauge(measure: float, status: str, emoji: str):
+    """
+    Render a credit-score-style gauge using Plotly.
+    Measure: we assume 0–6+ range, with:
+        0–1.5   Green
+        1.5–4.0 Yellow
+        4.0–6+  Red
+    """
+    # Clamp measure for visualization
+    max_scale = 6.0
+    value = min(max(measure, 0.0), max_scale)
+
+    fig = go.Figure(
+        go.Indicator(
+            mode="gauge+number",
+            value=value,
+            number={"suffix": "", "font": {"size": 32}},
+            title={"text": f"{emoji} {status}", "font": {"size": 18}},
+            gauge={
+                "axis": {"range": [0, max_scale]},
+                "bar": {"thickness": 0.3},
+                "steps": [
+                    {"range": [0, 1.5], "color": "#22c55e"},   # green
+                    {"range": [1.5, 4.0], "color": "#eab308"}, # yellow
+                    {"range": [4.0, max_scale], "color": "#ef4444"},  # red
+                ],
+            },
+        )
+    )
+    fig.update_layout(height=260, margin=dict(l=10, r=10, t=40, b=10))
+    st.plotly_chart(fig, use_container_width=True)
+
+
+# ==========================
+# Streamlit App
+# ==========================
+
+st.set_page_config(page_title="Credit Karma for Truckers", page_icon="🚛", layout="wide")
 st.title("🚛 Credit Karma for Truckers")
 
 st.write(
-    "Enter a USDOT number to translate FMCSA BASICs into an insurance-style score, "
-    "risk summary, and action plan. Lower is better (golf score)."
+    "Turn FMCSA BASIC scores into a simple safety score, insurance impact, and "
+    "a clear action plan. Lower is better (golf score)."
 )
 
-usdot = st.text_input("USDOT Number", placeholder="e.g. 44110")
+col_input, col_info = st.columns([2, 3])
 
-if st.button("Check BASICs"):
+with col_input:
+    usdot = st.text_input("USDOT Number", placeholder="e.g. 44110")
+    st.caption("Enter a carrier's USDOT number to see their BASIC profile.")
+
+with col_info:
+    st.info(
+        "This tool is a translation layer between FMCSA BASIC data and how underwriters "
+        "actually think about risk. It is **not** an official FMCSA or insurer rating."
+    )
+
+if st.button("Check Carrier", type="primary"):
     if not usdot.strip():
         st.error("Please enter a USDOT number.")
     else:
@@ -327,13 +401,14 @@ if st.button("Check BASICs"):
                         "Check that the DOT number is valid and has BASICs."
                     )
                 else:
-                    # Evaluate risk per BASIC
+                    # Evaluate risk for each BASIC
                     for b in basics_flat:
                         band, score = evaluate_basic_risk(b)
                         b["Risk Level"] = band
                         b["Risk Score"] = score
+                        b["Trend Label"] = trend_label_for_basic(b)
 
-                    # Compute carrier measure & status
+                    # Compute overall measure and status
                     measure = compute_carrier_measure(basics_flat)
                     status, emoji = status_from_measure(measure)
 
@@ -342,108 +417,161 @@ if st.button("Check BASICs"):
                         basics_flat, measure, status
                     )
 
-                    # Convert to DataFrame for display
                     df = pd.DataFrame(basics_flat)
-
-                    # ---------- Top summary ----------
-                    st.markdown("---")
-                    st.subheader("Overall Status")
-
-                    bg_color = {
-                        "Green": "#dcfce7",   # light green
-                        "Yellow": "#fef9c3",  # light yellow
-                        "Red": "#fee2e2",     # light red
-                    }.get(status, "#e5e7eb")  # gray fallback
-
-                    st.markdown(
-                        f"""
-                        <div style="
-                            background-color:{bg_color};
-                            padding:1rem;
-                            border-radius:0.75rem;
-                            border:1px solid #d4d4d4;
-                        ">
-                            <h2 style="margin:0; font-size:1.5rem;">
-                                {emoji} {status} – Overall Measure: {measure}
-                            </h2>
-                            <p style="margin:0.25rem 0 0; color:#4b5563;">
-                                Lower is better (golf score). This measure reflects your worst BASIC.
-                            </p>
-                        </div>
-                        """,
-                        unsafe_allow_html=True,
-                    )
-
-                    # ---------- Insurance impact ----------
-                    st.subheader("Insurance Impact Summary")
-
-                    st.markdown(
-                        f"""
-                        <div style="
-                            background-color:#eef2ff;
-                            padding:1rem;
-                            border-radius:0.75rem;
-                            border:1px solid #c7d2fe;
-                        ">
-                            <h3 style="margin:0; font-size:1.2rem;">
-                                {impact_band}
-                            </h3>
-                            <p style="margin:0.25rem 0 0; color:#4b5563;">
-                                {impact_text}
-                            </p>
-                        </div>
-                        """,
-                        unsafe_allow_html=True,
-                    )
-
-                    # ---------- Focus areas / Action plan ----------
-                    st.subheader("Focus Areas & Action Plan")
-
-                    # Sort BASICs by Risk Score (descending) and Percentile
                     df_sorted = df.sort_values(
                         by=["Risk Score", "Percentile (num)"],
                         ascending=[False, False],
                     )
 
-                    top_basics = df_sorted.head(3).to_dict(orient="records")
+                    st.markdown("---")
 
-                    if not top_basics:
-                        st.write("No significant risk areas identified.")
+                    # ========= Top score section: gauge + impact =========
+                    top_left, top_mid, top_right = st.columns([1.2, 1.2, 1.6])
+
+                    with top_left:
+                        st.subheader("Your Safety Score")
+                        render_gauge(measure, status, emoji)
+                        st.caption("Lower is better. This uses your worst BASIC Measure.")
+
+                    with top_mid:
+                        st.subheader("Status")
+                        if status == "Green":
+                            st.success(f"{emoji} {status} – Overall Measure: {measure}")
+                        elif status == "Yellow":
+                            st.warning(f"{emoji} {status} – Overall Measure: {measure}")
+                        else:
+                            st.error(f"{emoji} {status} – Overall Measure: {measure}")
+                        st.caption(
+                            "Green ≈ good credit, Yellow ≈ fair, Red ≈ substandard account."
+                        )
+
+                    with top_right:
+                        st.subheader("Insurance Impact")
+                        st.write(f"**{impact_band}**")
+                        st.write(impact_text)
+
+                    # ========= Factor cards =========
+                    st.markdown("---")
+                    st.subheader("Top Factors Affecting Your Insurance")
+
+                    top_factors = df_sorted.head(3).to_dict(orient="records")
+                    if not top_factors:
+                        st.write("No significant risk factors identified.")
                     else:
-                        for b in top_basics:
+                        cols = st.columns(len(top_factors))
+                        for col, b in zip(cols, top_factors):
+                            with col:
+                                name = b.get("BASIC") or b.get("BASIC Code")
+                                risk_level = b.get("Risk Level")
+                                pct = b.get("Percentile")
+                                thresh = b.get("Violation Threshold")
+                                insp = b.get("Inspections With Violation (24m)")
+                                viol = b.get("Total Violations (24m)")
+                                trend = b.get("Trend Label")
+
+                                st.markdown(f"**{name}**")
+                                st.write(trend)
+                                st.metric("Risk Level", risk_level, None)
+
+                                bullet_lines = []
+                                if pct is not None and thresh is not None:
+                                    bullet_lines.append(
+                                        f"Percentile {pct} vs threshold {thresh}"
+                                    )
+                                if insp is not None:
+                                    bullet_lines.append(
+                                        f"{insp} inspections with violations (24m)"
+                                    )
+                                if viol is not None:
+                                    bullet_lines.append(
+                                        f"{viol} total violations (24m)"
+                                    )
+
+                                for line in bullet_lines:
+                                    st.write(f"- {line}")
+
+                    # ========= Focus areas & action plan =========
+                    st.markdown("---")
+                    st.subheader("Focus Areas & Action Plan")
+
+                    if not top_factors:
+                        st.write("Nothing critical right now. Keep doing what you're doing.")
+                    else:
+                        for b in top_factors:
                             name = b.get("BASIC") or b.get("BASIC Code")
                             risk_level = b.get("Risk Level")
-                            pct = b.get("Percentile")
-                            thresh = b.get("Violation Threshold")
-                            insp = b.get("Inspections With Violation (24m)")
-                            viol = b.get("Total Violations (24m)")
+                            trend = b.get("Trend Label")
 
                             st.markdown(f"### {name} – {risk_level} priority")
-
-                            summary_bits = []
-                            if pct is not None and thresh is not None:
-                                summary_bits.append(f"Percentile {pct} vs threshold {thresh}")
-                            if insp is not None:
-                                summary_bits.append(f"{insp} inspections with violations")
-                            if viol is not None:
-                                summary_bits.append(f"{viol} total violations")
-
-                            if summary_bits:
-                                st.write(" • " + " | ".join(str(x) for x in summary_bits))
+                            st.caption(trend)
 
                             # Recommended actions
                             items = action_items_for_basic(name)
-                            st.write("**Recommended actions:**")
+                            st.write("**Recommended actions (next 60–90 days):**")
                             for item in items:
                                 st.write(f"- {item}")
 
-                    # ---------- BASIC details table ----------
+                    # ========= Simulator =========
+                    st.markdown("---")
+                    st.subheader("Simulator: What If We Improve a BASIC?")
+
+                    # Choose a BASIC to simulate
+                    basic_options = [
+                        b.get("BASIC") or b.get("BASIC Code")
+                        for b in basics_flat
+                        if b.get("Measure (num)") is not None
+                    ]
+                    basic_options = list(dict.fromkeys(basic_options))  # dedupe
+
+                    if not basic_options:
+                        st.info("No BASICs with numeric measures to simulate yet.")
+                    else:
+                        col_sim1, col_sim2 = st.columns([1.2, 1.8])
+                        with col_sim1:
+                            target_basic = st.selectbox(
+                                "Choose a BASIC to improve",
+                                basic_options,
+                            )
+                            reduction_pct = st.slider(
+                                "Reduce this BASIC's Measure by (%)",
+                                min_value=0,
+                                max_value=50,
+                                value=10,
+                                step=5,
+                            )
+
+                        with col_sim2:
+                            if target_basic:
+                                new_measure = simulate_basic_improvement(
+                                    basics_flat, target_basic, reduction_pct
+                                )
+                                sim_status, sim_emoji = status_from_measure(new_measure)
+
+                                st.metric(
+                                    label="Current Overall Measure",
+                                    value=measure,
+                                )
+                                st.metric(
+                                    label="Simulated Overall Measure",
+                                    value=new_measure,
+                                    delta=round(new_measure - measure, 3),
+                                )
+                                st.write(
+                                    f"If you reduce **{target_basic}** violations enough "
+                                    f"to lower its BASIC measure by **{reduction_pct}%**, "
+                                    f"your overall status would be approximately "
+                                    f"**{sim_emoji} {sim_status}**."
+                                )
+
+                    # ========= BASIC details table =========
+                    st.markdown("---")
                     st.subheader("BASIC Details")
 
                     preferred_cols = [
                         "BASIC",
                         "Risk Level",
                         "Risk Score",
+                        "Trend Label",
                         "Measure",
                         "Percentile",
                         "Violation Threshold",
@@ -461,18 +589,19 @@ if st.button("Check BASICs"):
 
                     st.dataframe(df[cols_to_show], use_container_width=True)
 
-                    # ---------- "Trend" / watch explanation ----------
+                    # ========= Trend notes =========
+                    st.markdown("---")
                     st.subheader("Trend & Watch Notes")
 
                     st.write(
                         "This view uses the latest BASIC snapshot from FMCSA. "
                         "True historical trends (up/down over time) require storing prior "
-                        "snapshots, which this MVP does not yet do. "
-                        "For now, treat BASICs marked as High or Medium risk as 'watch items' "
-                        "that could drive future rate increases if not corrected."
+                        "snapshots, which this MVP does not yet do. For now, treat "
+                        "BASICs marked as High or Medium risk as 'watch items' that could "
+                        "drive future rate increases if not corrected."
                     )
 
-                    # Raw JSON for debugging
+                    # Raw JSON for debugging if needed
                     with st.expander("Raw API Response (debug)"):
                         st.json(raw_data)
 
