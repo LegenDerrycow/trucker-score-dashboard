@@ -1015,3 +1015,13 @@ with tabs[3]:
         )
 
         if pdf_bytes is None:
+            st.warning("PDF export not available yet (missing `reportlab`). Add `reportlab` to requirements.txt.")
+        else:
+            st.download_button(
+                "⬇️ Download Broker PDF Report",
+                data=pdf_bytes,
+                file_name=f"usdot_{usdot.strip()}_renewal_prep_report.pdf",
+                mime="application/pdf",
+                use_container_width=True,
+            )
+
